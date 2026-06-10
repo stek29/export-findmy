@@ -31,6 +31,20 @@ The tool will prompt for:
 2. **2FA code** — enter the code shown on a trusted device, or the SMS code if Apple uses SMS verification
 3. **Device passcode** — the screen lock passcode (iPhone PIN) or login password (Mac) of the device listed
 
+After the keys have been exported and you no longer need this exporter to
+remain recoverable in iCloud Keychain, delete the escrow bottle it created:
+
+```bash
+./target/release/export-findmy \
+  --apple-id you@example.com \
+  --delete-own-escrow-bottle
+```
+
+Select only the synthetic exporter record, currently identified by serial
+`F2LZN0FAKE00` and model `iPhone15,2`. Its current bottle password is
+`findmy-export`. Verify all displayed metadata before confirming deletion;
+other entries can belong to your real Apple devices.
+
 ### Options
 
 | Flag | Description | Default |
@@ -43,6 +57,24 @@ The tool will prompt for:
 | `--clear-auth-cache` | Delete the cache before authenticating | off |
 | `--keychain-state <path>` | Trusted-peer/keychain state used to avoid rejoining | `keychain_state.plist` |
 | `--clear-keychain-state` | Delete trusted-peer state before joining | off |
+| `--delete-own-escrow-bottle` | Interactively select and delete an escrow bottle, then exit | off |
+
+Escrow bottle deletion is a maintenance operation:
+
+```bash
+./target/release/export-findmy \
+  --apple-id you@example.com \
+  --delete-own-escrow-bottle
+```
+
+The command lists viable bottles and requires successful recovery using the
+selected bottle's device passcode/password, an explicit `DELETE <index>`
+confirmation, and exact re-entry of the selected device serial. The list can
+include bottles belonging to real Apple devices, so verify the device name,
+model, serial, build, and escrow timestamp carefully. The command exits after
+deletion without joining the keychain or exporting accessories.
+It also bypasses the MobileMe delegate request because escrow maintenance only
+requires the authenticated Apple account and escrow service.
 
 For focused diagnostics without logging every dependency:
 
@@ -111,6 +143,10 @@ These files can be used directly with [FindMy.py](https://github.com/malmeloo/Fi
   by the exporter use mode `0600` on Unix, but you must also protect custom
   paths and backups yourself.
 - Your raw Apple ID password and device passcode are never written to disk.
+- After a successful export, delete the synthetic exporter escrow bottle with
+  `--delete-own-escrow-bottle` once it is no longer needed. This is especially
+  important while newly created bottles use the fixed `findmy-export`
+  password. Never delete a bottle belonging to a real Apple device.
 - When finished, securely remove exported plist/JSON files and all cache,
   account, keychain, and anisette state listed above unless you intentionally
   need them for later runs. Removing the state files requires authenticating

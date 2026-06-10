@@ -357,6 +357,34 @@ fn save_keychain_state(
     Ok(())
 }
 
+fn load_keychain_state<F>(path: &Path, dsid: &str, fresh_state: F) -> (KeychainClientState, bool)
+where
+    F: Fn() -> KeychainClientState,
+{
+    if path.exists() {
+        let loaded: Result<KeychainClientState, _> = plist::from_file(path);
+        match loaded {
+            Ok(state) if state.dsid == dsid => {
+                eprintln!(
+                    "  Loaded keychain trusted-peer state from {}",
+                    path.display()
+                );
+                (state, true)
+            }
+            Ok(_) => {
+                eprintln!("  Ignoring keychain state for a different Apple account");
+                (fresh_state(), false)
+            }
+            Err(error) => {
+                eprintln!("  Ignoring unreadable keychain state: {error}");
+                (fresh_state(), false)
+            }
+        }
+    } else {
+        (fresh_state(), false)
+    }
+}
+
 async fn login_interactive(
     apple_id: &str,
     login_info: LoginClientInfo,
@@ -375,6 +403,92 @@ async fn login_interactive(
     };
 
     AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client).await
+}
+
+async fn delete_escrow_bottle_interactive(
+    keychain: &KeychainClient<RemoteAnisetteProviderV3>,
+    verify_bottle_password: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bottles = keychain.get_viable_bottles().await?;
+    if bottles.is_empty() {
+        eprintln!("No usable escrow bottles found.");
+        return Ok(());
+    }
+
+    eprintln!("Found {} escrow bottle(s):", bottles.len());
+    for (i, (_, metadata)) in bottles.iter().enumerate() {
+        eprintln!("  [{}] {}", i, escrow_device_description(metadata));
+        eprintln!(
+            "      serial: {}, build: {}, escrowed: {}",
+            metadata.serial, metadata.build, metadata.timestamp
+        );
+    }
+
+    eprintln!();
+    eprintln!("WARNING: This list may include bottles belonging to real Apple devices.");
+    eprint!("Choose a bottle to delete, or press Enter to cancel: ");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let selection = input.trim().to_string();
+    if selection.is_empty() {
+        eprintln!("Deletion cancelled.");
+        return Ok(());
+    }
+
+    let index = selection
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid bottle index: {selection}"))?;
+    let (bottle, metadata) = bottles.get(index).ok_or_else(|| {
+        format!(
+            "Invalid bottle index {index}. Must be 0-{}.",
+            bottles.len() - 1
+        )
+    })?;
+
+    eprintln!(
+        "Selected: {} (serial {})",
+        escrow_device_description(metadata),
+        metadata.serial
+    );
+    if verify_bottle_password {
+        eprint!("Enter the passcode/password for this escrow bottle: ");
+        let bottle_password = read_password();
+        if let Err(error) = keychain
+            .recover_bottle(bottle, bottle_password.as_bytes())
+            .await
+        {
+            return Err(format!("Could not unlock the selected escrow bottle: {error}").into());
+        }
+        eprintln!("Escrow bottle unlocked successfully.");
+    } else {
+        eprintln!("WARNING: Bottle password verification has been explicitly bypassed.");
+    }
+
+    eprint!("Type DELETE {index} to permanently delete this escrow bottle: ");
+    input.clear();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() != format!("DELETE {index}") {
+        eprintln!("Deletion cancelled.");
+        return Ok(());
+    }
+
+    eprint!(
+        "Final confirmation: type the device serial {}: ",
+        metadata.serial
+    );
+    input.clear();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() != metadata.serial {
+        eprintln!("Deletion cancelled.");
+        return Ok(());
+    }
+
+    keychain.delete(bottle.id()).await?;
+    eprintln!(
+        "Deleted escrow bottle: {}",
+        escrow_device_description(metadata)
+    );
+    Ok(())
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -401,6 +515,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut clear_auth_cache = false;
     let mut keychain_state_path = PathBuf::from("keychain_state.plist");
     let mut clear_keychain_state = false;
+    let mut delete_own_escrow_bottle = false;
+    let mut skip_escrow_bottle_password = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -434,6 +550,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--clear-keychain-state" => {
                 clear_keychain_state = true;
             }
+            "--delete-own-escrow-bottle" => {
+                delete_own_escrow_bottle = true;
+            }
+            "--delete-own-escrow-bottle-without-password" => {
+                delete_own_escrow_bottle = true;
+                skip_escrow_bottle_password = true;
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: export_findmy [OPTIONS]");
                 eprintln!();
@@ -452,6 +575,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  --keychain-state <path> Trusted-peer state (default: keychain_state.plist)"
                 );
                 eprintln!("  --clear-keychain-state  Delete trusted-peer state before joining");
+                eprintln!(
+                    "  --delete-own-escrow-bottle  Interactively delete an escrow bottle and exit"
+                );
                 eprintln!();
                 eprintln!("WARNING: Output plist files contain private key material.");
                 return Ok(());
@@ -483,9 +609,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config: Arc<dyn OSConfig> = Arc::new(FakeIOSConfig::new());
+    let total_steps = if delete_own_escrow_bottle { 3 } else { 7 };
 
     // ── Step 1: Create anisette client ──────────────────────────────
-    eprintln!("[1/7] Connecting to anisette server...");
+    eprintln!("[1/{total_steps}] Connecting to anisette server...");
     let anisette_config_path = PathBuf::from_str("anisette_state").unwrap();
     std::fs::create_dir_all(&anisette_config_path).ok();
 
@@ -500,7 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // ── Step 2: Restore or login to Apple ───────────────────────────
-    eprintln!("[2/7] Authenticating Apple ID...");
+    eprintln!("[2/{total_steps}] Authenticating Apple ID...");
     let mut loaded_from_cache = false;
     let mut account = if use_auth_cache && auth_cache_path.exists() {
         match load_auth_cache(&auth_cache_path) {
@@ -539,6 +666,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut account = account.unwrap();
 
+    let spd = account.spd.as_ref().expect("No SPD after login");
+    let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap().to_string();
+    let adsid = spd["adsid"].as_string().unwrap().to_string();
+
+    eprintln!("  Logged in (dsid={})", dsid);
+
+    if delete_own_escrow_bottle {
+        if use_auth_cache {
+            save_auth_cache(&auth_cache_path, &account)?;
+            eprintln!(
+                "  Saved authentication cache to {}",
+                auth_cache_path.display()
+            );
+        }
+
+        eprintln!("[3/3] Setting up escrow maintenance...");
+        let fresh_keychain_state = || {
+            eprintln!("  Using default escrow proxy host");
+            KeychainClientState::new_with_host(
+                dsid.clone(),
+                adsid.clone(),
+                "https://p97-escrowproxy.icloud.com:443".to_string(),
+            )
+        };
+        let (keychain_state, _) =
+            load_keychain_state(&keychain_state_path, &dsid, fresh_keychain_state);
+
+        let account_arc = Arc::new(DebugMutex::new(account));
+        let token_provider = TokenProvider::new(account_arc, config.clone());
+        let cloudkit = Arc::new(CloudKitClient {
+            state: DebugRwLock::new(
+                CloudKitState::new(dsid.clone()).expect("Failed to create CloudKitState"),
+            ),
+            anisette: anisette_client.clone(),
+            config: config.clone(),
+            token_provider: token_provider.clone(),
+        });
+        let keychain_state_update_path = keychain_state_path.clone();
+        let keychain = KeychainClient {
+            anisette: anisette_client.clone(),
+            token_provider,
+            state: DebugRwLock::new(keychain_state),
+            config: config.clone(),
+            update_state: Box::new(move |state| {
+                if let Err(error) = save_keychain_state(&keychain_state_update_path, state) {
+                    eprintln!(
+                        "Warning: failed to save keychain trusted-peer state to {}: {error}",
+                        keychain_state_update_path.display()
+                    );
+                }
+            }),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: cloudkit,
+        };
+
+        delete_escrow_bottle_interactive(&keychain, !skip_escrow_bottle_password).await?;
+        return Ok(());
+    }
+
     // ── Step 3: Get MobileMe delegate ───────────────────────────────
     eprintln!("[3/7] Fetching MobileMe delegate...");
     let delegates =
@@ -568,12 +755,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let spd = account.spd.as_ref().expect("No SPD after login");
-    let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap().to_string();
-    let adsid = spd["adsid"].as_string().unwrap().to_string();
-
-    eprintln!("  Logged in (dsid={})", dsid);
-
     // ── Step 4: Create CloudKit + Keychain clients ──────────────────
     eprintln!("[4/7] Setting up CloudKit & Keychain...");
 
@@ -587,30 +768,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
     };
-    let mut restored_keychain_state = false;
-    let keychain_state = if keychain_state_path.exists() {
-        let loaded: Result<KeychainClientState, _> = plist::from_file(&keychain_state_path);
-        match loaded {
-            Ok(state) if state.dsid == dsid => {
-                restored_keychain_state = true;
-                eprintln!(
-                    "  Loaded keychain trusted-peer state from {}",
-                    keychain_state_path.display()
-                );
-                state
-            }
-            Ok(_) => {
-                eprintln!("  Ignoring keychain state for a different Apple account");
-                fresh_keychain_state()
-            }
-            Err(error) => {
-                eprintln!("  Ignoring unreadable keychain state: {error}");
-                fresh_keychain_state()
-            }
-        }
-    } else {
-        fresh_keychain_state()
-    };
+    let (keychain_state, restored_keychain_state) =
+        load_keychain_state(&keychain_state_path, &dsid, fresh_keychain_state);
 
     let account_arc = Arc::new(DebugMutex::new(account));
     let token_provider = TokenProvider::new(account_arc.clone(), config.clone());
