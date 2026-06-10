@@ -13,7 +13,7 @@ Should works on any platform? --- Tested on MacOS 26
 ## Build
 
 ```bash
-git clone https://github.com/thisiscam/export-findmy.git
+git clone https://github.com/stek29/export-findmy.git
 cd export-findmy
 cargo build --release
 ```
@@ -28,7 +28,7 @@ cargo build --release
 
 The tool will prompt for:
 1. **Password** (hidden input)
-2. **2FA code** — enter the **SMS code** sent to your phone, not the code shown on other devices
+2. **2FA code** — enter the code shown on a trusted device, or the SMS code if Apple uses SMS verification
 3. **Device passcode** — the screen lock passcode (iPhone PIN) or login password (Mac) of the device listed
 
 ### Options
@@ -38,6 +38,19 @@ The tool will prompt for:
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
 | `--output-dir <dir>` | Where to write plist files | `.` |
+| `--auth-cache <path>` | Plaintext authentication cache | `auth_cache.plist` |
+| `--no-auth-cache` | Disable authentication cache reads and writes | off |
+| `--clear-auth-cache` | Delete the cache before authenticating | off |
+| `--keychain-state <path>` | Trusted-peer/keychain state used to avoid rejoining | `keychain_state.plist` |
+| `--clear-keychain-state` | Delete trusted-peer state before joining | off |
+
+For focused diagnostics without logging every dependency:
+
+```bash
+RUST_BACKTRACE=1 \
+RUST_LOG=icloud_auth=debug,omnisette=debug,rustpush::icloud::keychain=debug \
+./target/debug/export-findmy --anisette-url "https://ani.neoarz.com"
+```
 
 ### Example
 
@@ -52,13 +65,14 @@ Password:
 [4/7] Setting up CloudKit & Keychain...
 [5/7] Joining iCloud Keychain trust circle...
   Found 1 escrow bottle(s):
-    [0] ......
-  Using escrow bottle from device: L2MPKH342P
+    [0] Wilbur's iPhone (iPhone, iPhone 14 Pro)
+        serial: L2MPKH342P, build: 21E219, escrowed: 2024-03-20 12:34:56
+  Using escrow bottle from device: Wilbur's iPhone (iPhone, iPhone 14 Pro) (serial L2MPKH342P)
   Enter the passcode of that device:
   Joined keychain trust circle!
 [6/7] Fetching FindMy accessories from CloudKit...
 [7/7] Writing plist files...
-  🎧 Wilbur's AirTag (AirTag) -> ./keys/Wilbur_s_AirTag.plist
+  🎧 Wilbur's AirTag (AirTag) -> ./keys/Wilbur_s_AirTag_01234567-89AB-CDEF-0123-456789ABCDEF.plist
 
 Done! Exported 1 accessory plist file(s) to ./keys
 ```
@@ -83,9 +97,24 @@ These files can be used directly with [FindMy.py](https://github.com/malmeloo/Fi
 
 ## Security notes
 
-- **Output plist files contain private key material.** Treat them like passwords.
-- Your Apple ID password and device passcode are never written to disk.
-- `anisette_state/` and `keystore.plist` are created in the working directory at runtime — these contain device provisioning state and keychain crypto keys. Delete them after use if you don't plan to run the tool again.
+- **Exported accessory files contain private key material.** This includes the
+  output plist files and any JSON files produced from them. Treat these files
+  like passwords: do not commit, publish, or send them to untrusted systems.
+- `auth_cache.plist` contains reusable Apple authentication tokens and the
+  SHA-256 hash of your password.
+- `keychain_state.plist` contains the local trusted-peer identity and synced
+  keychain state.
+- `keystore.plist` contains keychain cryptographic keys. Keep it together with
+  `keychain_state.plist`; both are required to reuse the trusted identity.
+- `anisette_state/` contains persistent device-provisioning state.
+- These default paths are ignored by Git. The plist cache/state files created
+  by the exporter use mode `0600` on Unix, but you must also protect custom
+  paths and backups yourself.
+- Your raw Apple ID password and device passcode are never written to disk.
+- When finished, securely remove exported plist/JSON files and all cache,
+  account, keychain, and anisette state listed above unless you intentionally
+  need them for later runs. Removing the state files requires authenticating
+  and joining the keychain trust circle again.
 - The anisette server only sees OTP header requests from your IP. It never sees your Apple ID, password, or iCloud data.
 
 ## How it works

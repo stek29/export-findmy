@@ -1,26 +1,30 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore}};
-use sha2::{Sha256, Digest};
+use keystore::{
+    init_keystore,
+    software::{NoEncryptor, SoftwareKeystore},
+};
 use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
-use omnisette::{AnisetteClient, ArcAnisetteClient};
+use omnisette::{AnisetteClient, ArcAnisetteClient, LoginClientInfo};
 use plist::Dictionary;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use icloud_auth::AppleAccountCache;
 use rustpush::cloudkit::{
-    pcs_keys_for_record, should_reset, CloudKitClient, CloudKitState,
-    FetchRecordChangesOperation, NO_ASSETS,
+    pcs_keys_for_record, should_reset, CloudKitClient, CloudKitState, FetchRecordChangesOperation,
+    NO_ASSETS,
 };
 use rustpush::cloudkit_proto::CloudKitRecord;
 use rustpush::findmy::{
-    BeaconAccessory, BeaconNamingRecord, BeaconRatchet,
-    KeyAlignmentRecord, MasterBeaconRecord,
-    SEARCH_PARTY_CONTAINER, FIND_MY_SERVICE,
+    BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord, MasterBeaconRecord,
+    FIND_MY_SERVICE, SEARCH_PARTY_CONTAINER,
 };
 use rustpush::keychain::{KeychainClient, KeychainClientState};
 use rustpush::{
@@ -177,8 +181,65 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
         "emoji".to_string(),
         plist::Value::String(acc.naming.emoji.clone()),
     );
-
     plist::Value::Dictionary(dict)
+}
+
+fn escrow_client_metadata_string<'a>(metadata: &'a plist::Value, key: &str) -> Option<&'a str> {
+    let plist::Value::Dictionary(metadata) = metadata else {
+        return None;
+    };
+    let plist::Value::String(value) = metadata.get(key)? else {
+        return None;
+    };
+    Some(value)
+}
+
+fn escrow_device_description(metadata: &rustpush::keychain::EscrowMetadata) -> String {
+    let name = escrow_client_metadata_string(&metadata.client_metadata, "device_name");
+    let model_class =
+        escrow_client_metadata_string(&metadata.client_metadata, "device_model_class");
+    let model = escrow_client_metadata_string(&metadata.client_metadata, "device_model");
+
+    let mut details = Vec::new();
+    if let Some(model_class) = model_class {
+        details.push(model_class);
+    }
+    if let Some(model) = model {
+        details.push(model);
+    }
+
+    match (name, details.is_empty()) {
+        (Some(name), false) => format!("{name} ({})", details.join(", ")),
+        (Some(name), true) => name.to_string(),
+        (None, false) => details.join(", "),
+        (None, true) => "unknown device".to_string(),
+    }
+}
+
+fn sanitize_filename_component(value: &str, fallback: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.chars().any(|c| c.is_alphanumeric()) {
+        sanitized
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn accessory_filename(name: &str, model: &str, stable_identifier: &str) -> String {
+    let safe_name = sanitize_filename_component(name, "Unknown");
+    let safe_model = sanitize_filename_component(model, "unknown-model");
+    let safe_identifier = sanitize_filename_component(stable_identifier, "unknown-id");
+    format!("{safe_name}_{safe_model}_{safe_identifier}.plist")
 }
 
 // ── Password reading ────────────────────────────────────────────────────
@@ -219,6 +280,103 @@ fn disable_echo_read() -> String {
     pass.trim().to_string()
 }
 
+fn load_auth_cache(path: &PathBuf) -> Result<AppleAccountCache, Box<dyn std::error::Error>> {
+    Ok(plist::from_file(path)?)
+}
+
+fn remove_auth_cache(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn save_auth_cache(
+    path: &PathBuf,
+    account: &AppleAccount<RemoteAnisetteProviderV3>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let cache = account.to_cache()?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let file = options.open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    plist::to_writer_xml(file, &cache)?;
+    Ok(())
+}
+
+fn save_keychain_state(
+    path: &Path,
+    state: &KeychainClientState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let file = options.open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    plist::to_writer_xml(file, state)?;
+    Ok(())
+}
+
+async fn login_interactive(
+    apple_id: &str,
+    login_info: LoginClientInfo,
+    anisette_client: ArcAnisetteClient<RemoteAnisetteProviderV3>,
+) -> Result<AppleAccount<RemoteAnisetteProviderV3>, icloud_auth::Error> {
+    eprint!("Password: ");
+    let password = read_password();
+    let apple_id = apple_id.to_string();
+    let password_hash: Vec<u8> = Sha256::digest(password.as_bytes()).to_vec();
+    let appleid_closure = move || (apple_id.clone(), password_hash.clone());
+    let tfa_closure = || {
+        eprint!("2FA code: ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        input.trim().to_string()
+    };
+
+    AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client).await
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -238,6 +396,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut apple_id = String::new();
     let mut anisette_url = "https://ani.sidestore.io".to_string();
     let mut output_dir = PathBuf::from(".");
+    let mut auth_cache_path = PathBuf::from("auth_cache.plist");
+    let mut use_auth_cache = true;
+    let mut clear_auth_cache = false;
+    let mut keychain_state_path = PathBuf::from("keychain_state.plist");
+    let mut clear_keychain_state = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -254,13 +417,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 output_dir = PathBuf::from(&args[i]);
             }
+            "--auth-cache" => {
+                i += 1;
+                auth_cache_path = PathBuf::from(&args[i]);
+            }
+            "--no-auth-cache" => {
+                use_auth_cache = false;
+            }
+            "--clear-auth-cache" => {
+                clear_auth_cache = true;
+            }
+            "--keychain-state" => {
+                i += 1;
+                keychain_state_path = PathBuf::from(&args[i]);
+            }
+            "--clear-keychain-state" => {
+                clear_keychain_state = true;
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: export_findmy [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --apple-id <email>       Apple ID email");
                 eprintln!("  --anisette-url <url>     Anisette server URL (default: https://ani.sidestore.io)");
-                eprintln!("  --output-dir <dir>       Output directory for plist files (default: .)");
+                eprintln!(
+                    "  --output-dir <dir>       Output directory for plist files (default: .)"
+                );
+                eprintln!(
+                    "  --auth-cache <path>     Plaintext auth cache (default: auth_cache.plist)"
+                );
+                eprintln!("  --no-auth-cache         Do not read or write the auth cache");
+                eprintln!("  --clear-auth-cache      Delete the cache before logging in");
+                eprintln!(
+                    "  --keychain-state <path> Trusted-peer state (default: keychain_state.plist)"
+                );
+                eprintln!("  --clear-keychain-state  Delete trusted-peer state before joining");
                 eprintln!();
                 eprintln!("WARNING: Output plist files contain private key material.");
                 return Ok(());
@@ -279,10 +470,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         apple_id = apple_id.trim().to_string();
     }
 
-    eprint!("Password: ");
-    let password = read_password();
-
     std::fs::create_dir_all(&output_dir)?;
+
+    if clear_auth_cache && remove_auth_cache(&auth_cache_path)? {
+        eprintln!("Removed auth cache: {}", auth_cache_path.display());
+    }
+    if clear_keychain_state && remove_auth_cache(&keychain_state_path)? {
+        eprintln!(
+            "Removed keychain trusted-peer state: {}",
+            keychain_state_path.display()
+        );
+    }
 
     let config: Arc<dyn OSConfig> = Arc::new(FakeIOSConfig::new());
 
@@ -293,72 +491,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let login_info = config.get_gsa_config(&APSState::default(), false);
 
-    let anisette_client: ArcAnisetteClient<RemoteAnisetteProviderV3> =
-        Arc::new(Mutex::new(AnisetteClient::new(
-            RemoteAnisetteProviderV3::new(
-                anisette_url.clone(),
-                login_info.clone(),
-                anisette_config_path,
-            ),
-        )));
+    let anisette_client: ArcAnisetteClient<RemoteAnisetteProviderV3> = Arc::new(Mutex::new(
+        AnisetteClient::new(RemoteAnisetteProviderV3::new(
+            anisette_url.clone(),
+            login_info.clone(),
+            anisette_config_path,
+        )),
+    ));
 
-    // ── Step 2: Login to Apple ──────────────────────────────────────
-    eprintln!("[2/7] Logging in to Apple ID...");
-    let apple_id_clone = apple_id.clone();
-    let password_hash: Vec<u8> = Sha256::digest(password.as_bytes()).to_vec();
-    let appleid_closure = move || (apple_id_clone.clone(), password_hash.clone());
-    let tfa_closure = || {
-        eprint!("2FA code: ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        input.trim().to_string()
+    // ── Step 2: Restore or login to Apple ───────────────────────────
+    eprintln!("[2/7] Authenticating Apple ID...");
+    let mut loaded_from_cache = false;
+    let mut account = if use_auth_cache && auth_cache_path.exists() {
+        match load_auth_cache(&auth_cache_path) {
+            Ok(cache) if cache.username.eq_ignore_ascii_case(&apple_id) => {
+                match AppleAccount::from_cache(cache, login_info.clone(), anisette_client.clone()) {
+                    Ok(account) => {
+                        loaded_from_cache = true;
+                        eprintln!("  Loaded cached authentication");
+                        Some(account)
+                    }
+                    Err(error) => {
+                        eprintln!("  Ignoring invalid auth cache: {error}");
+                        None
+                    }
+                }
+            }
+            Ok(cache) => {
+                eprintln!(
+                    "  Ignoring auth cache for a different Apple ID ({})",
+                    cache.username
+                );
+                None
+            }
+            Err(error) => {
+                eprintln!("  Ignoring unreadable auth cache: {error}");
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let account = AppleAccount::login(
-        appleid_closure,
-        tfa_closure,
-        login_info,
-        anisette_client.clone(),
-    )
-    .await?;
+    if account.is_none() {
+        account =
+            Some(login_interactive(&apple_id, login_info.clone(), anisette_client.clone()).await?);
+    }
+    let mut account = account.unwrap();
+
+    // ── Step 3: Get MobileMe delegate ───────────────────────────────
+    eprintln!("[3/7] Fetching MobileMe delegate...");
+    let delegates =
+        match login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::MobileMe])
+            .await
+        {
+            Ok(delegates) => delegates,
+            Err(error) if loaded_from_cache => {
+                eprintln!("  Cached authentication was rejected: {error}");
+                if remove_auth_cache(&auth_cache_path)? {
+                    eprintln!("  Removed rejected authentication cache");
+                }
+                eprintln!("  Falling back to a fresh login...");
+                account = login_interactive(&apple_id, login_info, anisette_client.clone()).await?;
+                login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::MobileMe])
+                    .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let mobileme = delegates.mobileme.expect("No MobileMe delegate returned");
+
+    if use_auth_cache {
+        save_auth_cache(&auth_cache_path, &account)?;
+        eprintln!(
+            "  Saved authentication cache to {}",
+            auth_cache_path.display()
+        );
+    }
 
     let spd = account.spd.as_ref().expect("No SPD after login");
-    let dsid = spd["DsPrsId"]
-        .as_unsigned_integer()
-        .unwrap()
-        .to_string();
+    let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap().to_string();
     let adsid = spd["adsid"].as_string().unwrap().to_string();
 
     eprintln!("  Logged in (dsid={})", dsid);
 
-    // ── Step 3: Get MobileMe delegate ───────────────────────────────
-    eprintln!("[3/7] Fetching MobileMe delegate...");
-    let delegates = login_apple_delegates(
-        &account,
-        None,
-        config.as_ref(),
-        &[LoginDelegate::MobileMe],
-    )
-    .await?;
-    let mobileme = delegates
-        .mobileme
-        .expect("No MobileMe delegate returned");
-
     // ── Step 4: Create CloudKit + Keychain clients ──────────────────
     eprintln!("[4/7] Setting up CloudKit & Keychain...");
 
-    let keychain_state = KeychainClientState::new(dsid.clone(), adsid.clone(), &mobileme)
-        .unwrap_or_else(|| {
+    let fresh_keychain_state = || {
+        KeychainClientState::new(dsid.clone(), adsid.clone(), &mobileme).unwrap_or_else(|| {
             eprintln!("  (escrowProxyUrl not in MobileMe config, using default)");
-            KeychainClientState::new_with_host(dsid.clone(), adsid.clone(), "https://p97-escrowproxy.icloud.com:443".to_string())
-        });
+            KeychainClientState::new_with_host(
+                dsid.clone(),
+                adsid.clone(),
+                "https://p97-escrowproxy.icloud.com:443".to_string(),
+            )
+        })
+    };
+    let mut restored_keychain_state = false;
+    let keychain_state = if keychain_state_path.exists() {
+        let loaded: Result<KeychainClientState, _> = plist::from_file(&keychain_state_path);
+        match loaded {
+            Ok(state) if state.dsid == dsid => {
+                restored_keychain_state = true;
+                eprintln!(
+                    "  Loaded keychain trusted-peer state from {}",
+                    keychain_state_path.display()
+                );
+                state
+            }
+            Ok(_) => {
+                eprintln!("  Ignoring keychain state for a different Apple account");
+                fresh_keychain_state()
+            }
+            Err(error) => {
+                eprintln!("  Ignoring unreadable keychain state: {error}");
+                fresh_keychain_state()
+            }
+        }
+    } else {
+        fresh_keychain_state()
+    };
 
     let account_arc = Arc::new(DebugMutex::new(account));
     let token_provider = TokenProvider::new(account_arc.clone(), config.clone());
     token_provider.set_mme_delegate(mobileme).await;
 
-    let cloudkit_state =
-        CloudKitState::new(dsid.clone()).expect("Failed to create CloudKitState");
+    let cloudkit_state = CloudKitState::new(dsid.clone()).expect("Failed to create CloudKitState");
     let cloudkit = Arc::new(CloudKitClient {
         state: DebugRwLock::new(cloudkit_state),
         anisette: anisette_client.clone(),
@@ -366,12 +624,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_provider: token_provider.clone(),
     });
 
+    let keychain_state_update_path = keychain_state_path.clone();
     let keychain = Arc::new(KeychainClient {
         anisette: anisette_client.clone(),
         token_provider: token_provider.clone(),
         state: DebugRwLock::new(keychain_state),
         config: config.clone(),
-        update_state: Box::new(|_| {}),
+        update_state: Box::new(move |state| {
+            if let Err(error) = save_keychain_state(&keychain_state_update_path, state) {
+                eprintln!(
+                    "Warning: failed to save keychain trusted-peer state to {}: {error}",
+                    keychain_state_update_path.display()
+                );
+            }
+        }),
         container: tokio::sync::Mutex::new(None),
         security_container: tokio::sync::Mutex::new(None),
         client: cloudkit.clone(),
@@ -379,42 +645,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Step 5: Join iCloud Keychain circle via escrow ────────────
     eprintln!("[5/7] Joining iCloud Keychain trust circle...");
-    let bottles = keychain.get_viable_bottles().await?;
-    if bottles.is_empty() {
-        return Err("No escrow bottles found. Make sure you have another trusted device.".into());
-    }
-    eprintln!("  Found {} escrow bottle(s):", bottles.len());
-    for (i, (_, meta)) in bottles.iter().enumerate() {
-        eprintln!("    [{}] {}", i, meta.serial);
-    }
-    let bottle_idx = if bottles.len() == 1 {
-        0
+    if restored_keychain_state && keychain.is_in_clique().await {
+        eprintln!("  Reusing saved keychain trust identity");
     } else {
-        eprint!("  Choose bottle [0]: ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let idx = input.trim().parse::<usize>().unwrap_or(0);
-        if idx >= bottles.len() {
-            return Err(format!("Invalid bottle index {}. Must be 0-{}.", idx, bottles.len() - 1).into());
+        if restored_keychain_state {
+            eprintln!("  Saved keychain identity is no longer trusted; joining again");
         }
-        idx
-    };
-    let (bottle, meta) = &bottles[bottle_idx];
-    eprintln!("  Using escrow bottle from device: {}", meta.serial);
-    eprint!("  Enter the passcode of that device: ");
-    let passcode = read_password();
+        let bottles = keychain.get_viable_bottles().await?;
+        if bottles.is_empty() {
+            return Err(
+                "No usable escrow bottles found. Re-run with RUST_LOG=rustpush::icloud::keychain=info \
+                 to see whether Apple returned no bottle records or whether their metadata could not be matched. \
+                 Confirm iCloud Keychain is enabled on a trusted Apple device and that device has a passcode."
+                    .into(),
+            );
+        }
+        eprintln!("  Found {} escrow bottle(s):", bottles.len());
+        for (i, (_, meta)) in bottles.iter().enumerate() {
+            eprintln!("    [{}] {}", i, escrow_device_description(meta));
+            eprintln!(
+                "        serial: {}, build: {}, escrowed: {}",
+                meta.serial, meta.build, meta.timestamp
+            );
+        }
+        let bottle_idx = if bottles.len() == 1 {
+            0
+        } else {
+            eprint!("  Choose bottle [0]: ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let idx = input.trim().parse::<usize>().unwrap_or(0);
+            if idx >= bottles.len() {
+                return Err(format!(
+                    "Invalid bottle index {}. Must be 0-{}.",
+                    idx,
+                    bottles.len() - 1
+                )
+                .into());
+            }
+            idx
+        };
+        let (bottle, meta) = &bottles[bottle_idx];
+        eprintln!(
+            "  Using escrow bottle from device: {} (serial {})",
+            escrow_device_description(meta),
+            meta.serial
+        );
+        eprint!("  Enter the passcode of that device: ");
+        let passcode = read_password();
 
-    keychain
-        .join_clique_from_escrow(bottle, passcode.as_bytes(), b"findmy-export")
-        .await?;
-    eprintln!("  Joined keychain trust circle!");
+        keychain
+            .join_clique_from_escrow(bottle, passcode.as_bytes(), b"findmy-export")
+            .await?;
+        let state = keychain.state.read().await;
+        save_keychain_state(&keychain_state_path, &*state)?;
+        eprintln!("  Joined keychain trust circle!");
+    }
 
     // ── Step 6: Fetch BeaconStore records from CloudKit ─────────────
     eprintln!("[6/7] Fetching FindMy accessories from CloudKit...");
 
-    let container = SEARCH_PARTY_CONTAINER
-        .init(cloudkit.clone())
-        .await?;
+    let container = SEARCH_PARTY_CONTAINER.init(cloudkit.clone()).await?;
     let beacon_zone = container.private_zone("BeaconStore".to_string());
     let key = container
         .get_zone_encryption_config(&beacon_zone, &keychain, &FIND_MY_SERVICE)
@@ -451,55 +742,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .name()
             .to_string();
-        let Some(record) = change.record else { continue };
+        let Some(record) = change.record else {
+            continue;
+        };
         let record_type = record.r#type.as_ref().unwrap().name().to_string();
 
         if record_type == MasterBeaconRecord::record_type() {
             let pcs = pcs_keys_for_record(&record, &key)?;
-            let item =
-                MasterBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs));
+            let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs));
             beacon_records.insert(identifier, item);
         } else if record_type == BeaconNamingRecord::record_type() {
             let pcs = pcs_keys_for_record(&record, &key)?;
-            let item =
-                BeaconNamingRecord::from_record_encrypted(&record.record_field, Some(&pcs));
-            naming_records.insert(
-                item.associated_beacon.clone(),
-                (identifier, item),
-            );
+            let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some(&pcs));
+            naming_records.insert(item.associated_beacon.clone(), (identifier, item));
         } else if record_type == KeyAlignmentRecord::record_type() {
             let pcs = pcs_keys_for_record(&record, &key)?;
-            let item =
-                KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs));
-            alignment_records.insert(
-                item.beacon_identifier.clone(),
-                (identifier, item),
-            );
+            let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs));
+            alignment_records.insert(item.beacon_identifier.clone(), (identifier, item));
         }
     }
 
     // ── Assemble accessories ────────────────────────────────────────
     let mut accessories: HashMap<String, BeaconAccessory> = HashMap::new();
+    let mut matched_naming_records = 0usize;
+    let mut matched_alignment_records = 0usize;
+    let mut missing_naming_records = Vec::new();
+    let mut missing_alignment_records = Vec::new();
 
     for (id, master) in beacon_records {
         let stable_id = master.stable_identifier.clone();
-        let naming = naming_records
-            .remove(&stable_id)
-            .unwrap_or_else(|| {
+        let model = master.model.clone();
+        let naming = match naming_records.remove(&id) {
+            Some(naming) => {
+                matched_naming_records += 1;
+                naming
+            }
+            None => {
+                missing_naming_records.push((stable_id.clone(), model.clone()));
                 (
                     String::new(),
                     BeaconNamingRecord {
                         emoji: "".to_string(),
                         name: format!("Unknown-{}", &stable_id[..8.min(stable_id.len())]),
-                        associated_beacon: stable_id.clone(),
+                        associated_beacon: id.clone(),
                         role_id: 0,
                     },
                 )
-            });
-        let alignment = alignment_records
-            .remove(&stable_id)
-            .map(|(id, rec)| (id, rec))
-            .unwrap_or_default();
+            }
+        };
+        let alignment = match alignment_records.remove(&id) {
+            Some((alignment_id, alignment)) => {
+                matched_alignment_records += 1;
+                (alignment_id, alignment)
+            }
+            None => {
+                missing_alignment_records.push((stable_id.clone(), model));
+                Default::default()
+            }
+        };
         accessories.insert(
             id,
             BeaconAccessory {
@@ -518,6 +818,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    eprintln!(
+        "  Matched names for {}/{} accessories and alignment for {}/{}",
+        matched_naming_records,
+        accessories.len(),
+        matched_alignment_records,
+        accessories.len()
+    );
+    for (stable_id, model) in &missing_naming_records {
+        eprintln!("    No naming record: {stable_id} ({model})");
+    }
+    for (stable_id, model) in &missing_alignment_records {
+        eprintln!("    No alignment record: {stable_id} ({model})");
+    }
+    if !naming_records.is_empty() || !alignment_records.is_empty() {
+        eprintln!(
+            "  Ignored {} unmatched naming record(s) and {} unmatched alignment record(s)",
+            naming_records.len(),
+            alignment_records.len()
+        );
+    }
+
     // ── Step 7: Write plist files ───────────────────────────────────
     eprintln!("[7/7] Writing plist files...");
 
@@ -526,18 +847,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    for acc in accessories.values() {
-        let safe_name: String = acc
-            .naming
-            .name
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect();
-        let filename = format!("{}.plist", safe_name);
-        let path = output_dir.join(&filename);
+    let mut output_paths = HashSet::new();
 
-        let plist_val = accessory_to_plist(acc);
-        plist::to_file_xml(&path, &plist_val)?;
+    for acc in accessories.values() {
+        let filename = accessory_filename(
+            &acc.naming.name,
+            &acc.master_record.model,
+            &acc.master_record.stable_identifier,
+        );
+        let path = output_dir.join(filename);
+        if !output_paths.insert(path.clone()) {
+            return Err(format!(
+                "multiple accessories resolve to the same output path: {}",
+                path.display()
+            )
+            .into());
+        }
+        plist::to_file_xml(&path, &accessory_to_plist(acc))?;
 
         eprintln!(
             "  {} {} ({}) -> {}",
@@ -556,4 +882,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accessory_filename, remove_auth_cache, sanitize_filename_component};
+    use std::fs;
+
+    #[test]
+    fn duplicate_names_use_distinct_identifiers() {
+        let first = accessory_filename("Keys", "AirTag", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE");
+        let second = accessory_filename("Keys", "AirTag", "11111111-2222-3333-4444-555555555555");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            "Keys_AirTag_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE.plist"
+        );
+    }
+
+    #[test]
+    fn filename_components_replace_unsafe_characters() {
+        assert_eq!(
+            accessory_filename(
+                "Work / Bag",
+                "AirPods Pro (3rd generation)",
+                "id:with/slashes"
+            ),
+            "Work___Bag_AirPods_Pro__3rd_generation__id_with_slashes.plist"
+        );
+    }
+
+    #[test]
+    fn empty_components_get_readable_fallbacks() {
+        assert_eq!(sanitize_filename_component("", "fallback"), "fallback");
+        assert_eq!(
+            accessory_filename("", "", ""),
+            "Unknown_unknown-model_unknown-id.plist"
+        );
+    }
+
+    #[test]
+    fn removing_auth_cache_is_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "export-findmy-auth-cache-test-{}.plist",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, b"rejected cache").unwrap();
+
+        assert!(remove_auth_cache(&path).unwrap());
+        assert!(!path.exists());
+        assert!(!remove_auth_cache(&path).unwrap());
+    }
 }

@@ -5,11 +5,11 @@ edition = "2021"
 description = "Export AirTag/FindMy accessory private keys from iCloud, producing plist files compatible with FindMy.py"
 
 [dependencies]
-rustpush = { git = "https://github.com/thisiscam/rustpush.git", branch = "findmy-export-support", default-features = false, features = ["remote-anisette-v3"] }
-omnisette = { git = "https://github.com/thisiscam/rustpush.git", branch = "findmy-export-support" }
-icloud_auth = { git = "https://github.com/thisiscam/rustpush.git", branch = "findmy-export-support", default-features = false, features = ["remote-anisette-v3"] }
-keystore = { git = "https://github.com/thisiscam/rustpush.git", branch = "findmy-export-support" }
-cloudkit-proto = { git = "https://github.com/thisiscam/rustpush.git", branch = "findmy-export-support" }
+rustpush = { git = "https://github.com/stek29/rustpush.git", branch = "local/export-findmy-changes", default-features = false, features = ["remote-anisette-v3"] }
+omnisette = { git = "https://github.com/stek29/rustpush.git", branch = "local/export-findmy-changes" }
+icloud_auth = { git = "https://github.com/stek29/rustpush.git", branch = "local/export-findmy-changes", default-features = false, features = ["remote-anisette-v3"] }
+keystore = { git = "https://github.com/stek29/rustpush.git", branch = "local/export-findmy-changes" }
+cloudkit-proto = { git = "https://github.com/stek29/rustpush.git", branch = "local/export-findmy-changes" }
 tokio = { version = "1", features = ["full"] }
 plist = "1.7.0"
 sha2 = "0.10.8"
