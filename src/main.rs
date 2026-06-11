@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use toml_edit::{value, Document};
 
-use icloud_auth::AppleAccountCache;
+use icloud_auth::{AppleAccountCache, LoginStep, SecondFactorMethod};
 use rustpush::cloudkit::{
     pcs_keys_for_record, should_reset, CloudKitClient, CloudKitState, FetchRecordChangesOperation,
     NO_ASSETS,
@@ -795,14 +795,51 @@ async fn login_interactive(
     let apple_id = apple_id.to_string();
     let password_hash: Vec<u8> = Sha256::digest(password.as_bytes()).to_vec();
     let appleid_closure = move || (apple_id.clone(), password_hash.clone());
-    let tfa_closure = || {
-        eprint!("2FA code: ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        input.trim().to_string()
-    };
 
-    AppleAccount::login(appleid_closure, tfa_closure, login_info, anisette_client).await
+    let (mut account, step) =
+        AppleAccount::login_step_start(appleid_closure, login_info, anisette_client).await?;
+
+    let mut current_step = step;
+    loop {
+        match current_step {
+            LoginStep::Complete => return Ok(account),
+            LoginStep::ChooseSecondFactor(methods) => {
+                for (i, method) in methods.iter().enumerate() {
+                    match method {
+                        SecondFactorMethod::TrustedDevice => {
+                            eprintln!("  {i} - Trusted Device");
+                        }
+                        SecondFactorMethod::Sms { display_number, .. } => {
+                            eprintln!("  {i} - SMS ({display_number})");
+                        }
+                    }
+                }
+                eprint!("Method [0]: ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).unwrap();
+                let index = input.trim().parse::<usize>().unwrap_or(0);
+                let method = methods
+                    .get(index)
+                    .ok_or_else(|| {
+                        icloud_auth::Error::AuthSrpWithMessage(
+                            0,
+                            format!(
+                                "Invalid method index {index}. Must be 0-{}.",
+                                methods.len() - 1
+                            ),
+                        )
+                    })?;
+                current_step = account.login_choose_method(method).await?;
+            }
+            LoginStep::EnterCode(_pending) => {
+                eprint!("Code: ");
+                let mut code = String::new();
+                std::io::stdin().read_line(&mut code).unwrap();
+                let code = code.trim().to_string();
+                current_step = account.login_submit_code(_pending, code).await?;
+            }
+        }
+    }
 }
 
 async fn delete_escrow_bottle_interactive(

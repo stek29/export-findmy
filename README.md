@@ -44,9 +44,13 @@ When changing the device preset, keep `model`, `model_class`, `os_version`,
 
 The tool will prompt for:
 1. **Password** (hidden input)
-2. **2FA code** — enter the code shown on a trusted device, or the SMS code if Apple uses SMS verification
-3. **Device passcode** — the screen lock passcode (iPhone PIN) or login password (Mac) of the device listed
-4. **Escrow password setup** — generate a random 16-character password or
+2. **2FA method** — choose from available methods (trusted device, SMS to one or
+   more phone numbers). SMS is always offered when phone numbers are registered
+   on the account, even if Apple reports trusted-device 2FA. Only the trusted
+   device flow has been live-tested; SMS selection is implemented but untested.
+3. **2FA code** — enter the code pushed to the selected method
+4. **Device passcode** — the screen lock passcode (iPhone PIN) or login password (Mac) of the device listed
+5. **Escrow password setup** — generate a random 16-character password or
    enter and confirm your own password
 
 After the keys have been exported and you no longer need this exporter to
@@ -142,8 +146,12 @@ Using device profile: .local/device-profile.toml
 Generated and saved persistent device UUID and UDID in .local/device-profile.toml
 Password:
 [1/7] Connecting to anisette server...
-[2/7] Logging in to Apple ID...
-2FA code: 123456
+[2/7] Authenticating Apple ID...
+  0 - Trusted Device
+  1 - SMS (+1 ••• •• •• 37)
+  2 - SMS (+44 ••• •• •• 89)
+Method [0]: 0
+Code: 123456
   Logged in (dsid=......)
 [3/7] Fetching MobileMe delegate...
 [4/7] Setting up CloudKit & Keychain...
@@ -238,7 +246,7 @@ Both files contain the same private key material and can be used directly with [
 
 ## How it works
 
-1. Authenticates to Apple via SRP (using remote anisette for device identity tokens)
+1. Authenticates to Apple via SRP, then interactively selects a 2FA method (trusted device or SMS) and verifies the code
 2. Fetches MobileMe delegate tokens via the iOS `iosbuddy` login endpoint
 3. Joins the iCloud Keychain trust circle via escrow recovery (using your device passcode)
 4. Fetches encrypted `BeaconStore` records from CloudKit
