@@ -1,0 +1,29 @@
+# Copy this template to a private, gitignored directory before using it:
+#   cp device-profile.template.toml .local/device-profile.toml
+#
+# Then edit the copy and pass it with:
+#   --device-profile .local/device-profile.toml
+#
+# The exporter refuses to run directly from a *.template.toml file.
+
+[device]
+name = "FindMy Export"
+serial = "F2LZN0FAKE00"
+
+# These identifiers are generated once and saved into your copied profile.
+device_uuid = ""
+udid = ""
+
+[software]
+model = "iPhone15,2"
+model_class = "iMac"
+os_version = "17.4"
+build = "21E219"
+cfnetwork_version = "1494.0.7"
+darwin_version = "23.4.0"
+
+[escrow]
+# Generated or entered interactively when the exporter first creates a bottle.
+# This makes the copied profile secret; never commit or share it.
+password = ""
+configured = false

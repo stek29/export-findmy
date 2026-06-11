@@ -1,13 +1,3 @@
 /target/
 Cargo.lock
 /vendor/
-/keys/
-
-/keystore.plist
-/anisette_state/
-/auth_cache.plist
-/keychain_state.plist
-
-# Sensitive state used by scripts/fetch_locations.py.
-/account.json
-/ani_libs.bin

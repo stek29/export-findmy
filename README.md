@@ -20,16 +20,34 @@ cargo build --release
 
 ## Usage
 
+Create a private local workspace from the committed template, then edit the
+copied identity if desired:
+
+```bash
+cp device-profile.template.toml .local/device-profile.toml
+$EDITOR .local/device-profile.toml
+```
+
+The exporter refuses to run directly from a `*.template.toml` file. The
+`.local/` directory is ignored by Git. Keep using the same copied profile: its
+UUID, UDID, and escrow password are generated or entered on first use and
+persisted there. The private profile uses `[device]`, `[software]`, and
+`[escrow]` sections and is rewritten atomically with mode `0600` on Unix.
+When changing the device preset, keep `model`, `model_class`, `os_version`,
+`build`, `cfnetwork_version`, and `darwin_version` consistent with one another.
+
 ```bash
 ./target/release/export-findmy \
   --apple-id you@example.com \
-  --output-dir ./keys
+  --device-profile .local/device-profile.toml
 ```
 
 The tool will prompt for:
 1. **Password** (hidden input)
 2. **2FA code** — enter the code shown on a trusted device, or the SMS code if Apple uses SMS verification
 3. **Device passcode** — the screen lock passcode (iPhone PIN) or login password (Mac) of the device listed
+4. **Escrow password setup** — generate a random 16-character password or
+   enter and confirm your own password
 
 After the keys have been exported and you no longer need this exporter to
 remain recoverable in iCloud Keychain, delete the escrow bottle it created:
@@ -37,13 +55,32 @@ remain recoverable in iCloud Keychain, delete the escrow bottle it created:
 ```bash
 ./target/release/export-findmy \
   --apple-id you@example.com \
+  --device-profile .local/device-profile.toml \
   --delete-own-escrow-bottle
 ```
 
-Select only the synthetic exporter record, currently identified by serial
-`F2LZN0FAKE00` and model `iPhone15,2`. Its current bottle password is
-`findmy-export`. Verify all displayed metadata before confirming deletion;
-other entries can belong to your real Apple devices.
+Select only the synthetic exporter record identified by the name, serial,
+model, and model class in your device profile. Press Enter at the escrow
+password prompt to use the password stored in `[escrow]`, or enter a different
+password for a bottle created with another profile or password. Verify all
+displayed metadata before confirming deletion; other entries can belong to
+your real Apple devices.
+
+By default, all generated local data is kept beside the selected profile:
+
+```text
+.local/
+├── device-profile.toml
+├── auth_cache.plist
+├── keychain_state.plist
+├── keystore.plist
+├── anisette_state/
+└── keys/
+```
+
+The plist and anisette state intentionally remain separate files. They contain
+large or frequently updated binary data; embedding them would make every state
+change rewrite the identity and password profile and increase corruption risk.
 
 ### Options
 
@@ -51,28 +88,41 @@ other entries can belong to your real Apple devices.
 |------|-------------|---------|
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
-| `--output-dir <dir>` | Where to write plist files | `.` |
-| `--auth-cache <path>` | Plaintext authentication cache | `auth_cache.plist` |
+| `--device-profile <path>` | Private device identity, escrow password, and local workspace | `.local/device-profile.toml` |
+| `--output-dir <dir>` | Where to write plist files | `<profile-dir>/keys` |
+| `--auth-cache <path>` | Plaintext authentication cache | `<profile-dir>/auth_cache.plist` |
 | `--no-auth-cache` | Disable authentication cache reads and writes | off |
 | `--clear-auth-cache` | Delete the cache before authenticating | off |
-| `--keychain-state <path>` | Trusted-peer/keychain state used to avoid rejoining | `keychain_state.plist` |
+| `--keychain-state <path>` | Trusted-peer/keychain state used to avoid rejoining | `<profile-dir>/keychain_state.plist` |
 | `--clear-keychain-state` | Delete trusted-peer state before joining | off |
 | `--delete-own-escrow-bottle` | Interactively select and delete an escrow bottle, then exit | off |
+
+The escrow password is loaded in this order:
+
+1. `EXPORT_FINDMY_ESCROW_PASSWORD`
+2. `password` under `[escrow]` in the private device profile
+3. Interactive first-time setup
+
+Once a password is configured, group- or other-readable private profiles are
+rejected on Unix. The environment override is ephemeral and is not written
+into the profile.
 
 Escrow bottle deletion is a maintenance operation:
 
 ```bash
 ./target/release/export-findmy \
   --apple-id you@example.com \
+  --device-profile .local/device-profile.toml \
   --delete-own-escrow-bottle
 ```
 
 The command lists viable bottles and requires successful recovery using the
-selected bottle's device passcode/password, an explicit `DELETE <index>`
-confirmation, and exact re-entry of the selected device serial. The list can
-include bottles belonging to real Apple devices, so verify the device name,
-model, serial, build, and escrow timestamp carefully. The command exits after
-deletion without joining the keychain or exporting accessories.
+selected bottle's password, an explicit `DELETE <index>` confirmation, and
+exact re-entry of the selected device serial. Press Enter to use the saved
+profile password, or type another bottle password. The list can include
+bottles belonging to real Apple devices, so verify the device name, model,
+serial, build, and escrow timestamp carefully. The command exits after deletion
+without joining the keychain or exporting accessories.
 It also bypasses the MobileMe delegate request because escrow maintenance only
 requires the authenticated Apple account and escrow service.
 
@@ -87,7 +137,9 @@ RUST_LOG=icloud_auth=debug,omnisette=debug,rustpush::icloud::keychain=debug \
 ### Example
 
 ```
-$ ./target/release/export-findmy --apple-id xxxx@xxx --output-dir ./keys
+$ ./target/release/export-findmy --apple-id xxxx@xxx --device-profile .local/device-profile.toml
+Using device profile: .local/device-profile.toml
+Generated and saved persistent device UUID and UDID in .local/device-profile.toml
 Password:
 [1/7] Connecting to anisette server...
 [2/7] Logging in to Apple ID...
@@ -101,12 +153,17 @@ Password:
         serial: L2MPKH342P, build: 21E219, escrowed: 2024-03-20 12:34:56
   Using escrow bottle from device: Wilbur's iPhone (iPhone, iPhone 14 Pro) (serial L2MPKH342P)
   Enter the passcode of that device:
+No escrow password exists for this device profile.
+  [1] Generate a random password
+  [2] Enter my own password
+Choice [1]:
+Saved escrow password in .local/device-profile.toml
   Joined keychain trust circle!
 [6/7] Fetching FindMy accessories from CloudKit...
 [7/7] Writing plist files...
-  🎧 Wilbur's AirTag (AirTag) -> ./keys/Wilbur_s_AirTag_01234567-89AB-CDEF-0123-456789ABCDEF.plist
+  🎧 Wilbur's AirTag (AirTag) -> .local/keys/Wilbur_s_AirTag_01234567-89AB-CDEF-0123-456789ABCDEF.plist
 
-Done! Exported 1 accessory plist file(s) to ./keys
+Done! Exported 1 accessory plist file(s) to .local/keys
 ```
 
 ## Output format
@@ -134,19 +191,22 @@ These files can be used directly with [FindMy.py](https://github.com/malmeloo/Fi
   like passwords: do not commit, publish, or send them to untrusted systems.
 - `auth_cache.plist` contains reusable Apple authentication tokens and the
   SHA-256 hash of your password.
+- The private `device-profile.toml` contains the persistent synthetic device
+  identity and escrow password. That password is not your Apple ID password or
+  a physical device passcode. Keep its UUID, UDID, and password stable after
+  creating a bottle, and never commit or share the file.
 - `keychain_state.plist` contains the local trusted-peer identity and synced
   keychain state.
 - `keystore.plist` contains keychain cryptographic keys. Keep it together with
   `keychain_state.plist`; both are required to reuse the trusted identity.
 - `anisette_state/` contains persistent device-provisioning state.
-- These default paths are ignored by Git. The plist cache/state files created
-  by the exporter use mode `0600` on Unix, but you must also protect custom
-  paths and backups yourself.
+- The recommended `.local/` workspace is ignored by Git. Sensitive files
+  created by the exporter use mode `0600` on Unix, but you must also protect
+  custom paths and backups yourself.
 - Your raw Apple ID password and device passcode are never written to disk.
 - After a successful export, delete the synthetic exporter escrow bottle with
-  `--delete-own-escrow-bottle` once it is no longer needed. This is especially
-  important while newly created bottles use the fixed `findmy-export`
-  password. Never delete a bottle belonging to a real Apple device.
+  `--delete-own-escrow-bottle` once it is no longer needed. Never delete a
+  bottle belonging to a real Apple device.
 - When finished, securely remove exported plist/JSON files and all cache,
   account, keychain, and anisette state listed above unless you intentionally
   need them for later runs. Removing the state files requires authenticating
