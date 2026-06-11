@@ -352,6 +352,12 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
         "emoji".to_string(),
         plist::Value::String(acc.naming.emoji.clone()),
     );
+    if let Some(ref gid) = acc.master_record.group_identifier {
+        dict.insert(
+            "groupIdentifier".to_string(),
+            plist::Value::String(gid.clone()),
+        );
+    }
     plist::Value::Dictionary(dict)
 }
 
@@ -404,7 +410,7 @@ fn accessory_to_json(acc: &BeaconAccessory) -> serde_json::Value {
         "name": acc.naming.name.clone(),
         "model": acc.master_record.model.clone(),
         "identifier": acc.master_record.stable_identifier.clone(),
-        "group_identifier": None::<String>,
+        "group_identifier": acc.master_record.group_identifier.clone(),
         "serial_number": serial_from_identifier(&acc.master_record.stable_identifier),
         "alignment_date": alignment_date,
         "alignment_index": acc.alignment.last_index_observed,
@@ -1727,6 +1733,7 @@ configured = false
             model: "AirTag".to_string(),
             vendor_id: 1,
             is_zeus: 0,
+            group_identifier: None,
         };
 
         let naming = BeaconNamingRecord {

@@ -186,6 +186,7 @@ Each accessory produces a matched pair of files with the same basename:
 | `emoji` | User-assigned emoji |
 | `model` | Hardware model |
 | `pairingDate` | When the accessory was paired |
+| `groupIdentifier` | Group ID for multi-part accessories (e.g. AirPods), if present |
 
 ### JSON contents
 
@@ -199,7 +200,7 @@ Each accessory produces a matched pair of files with the same basename:
 | `name` | User-assigned name |
 | `model` | Hardware model |
 | `identifier` | Stable accessory identifier |
-| `group_identifier` | Group ID for multi-part accessories (e.g. AirPods) — always `null` for now |
+| `group_identifier` | Group ID for multi-part accessories (e.g. AirPods) |
 | `serial_number` | Parsed hardware serial number, when detectable |
 | `alignment_date` | Last known alignment timestamp (ISO 8601) |
 | `alignment_index` | Key index at the alignment timestamp |
