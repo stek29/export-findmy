@@ -1,6 +1,6 @@
 # export-findmy
 
-Export AirTag/FindMy accessory private keys from iCloud, producing `.plist` files compatible with [FindMy.py](https://github.com/malmeloo/FindMy.py).
+Export AirTag/FindMy accessory private keys from iCloud, producing `.plist` and `.json` files compatible with [FindMy.py](https://github.com/malmeloo/FindMy.py).
 
 Should works on any platform? --- Tested on MacOS 26
 
@@ -89,7 +89,7 @@ change rewrite the identity and password profile and increase corruption risk.
 | `--apple-id <email>` | Apple ID email | prompted if omitted |
 | `--anisette-url <url>` | Anisette v3 server URL | `https://ani.sidestore.io` |
 | `--device-profile <path>` | Private device identity, escrow password, and local workspace | `.local/device-profile.toml` |
-| `--output-dir <dir>` | Where to write plist files | `<profile-dir>/keys` |
+| `--output-dir <dir>` | Where to write plist and json files | `<profile-dir>/keys` |
 | `--auth-cache <path>` | Plaintext authentication cache | `<profile-dir>/auth_cache.plist` |
 | `--no-auth-cache` | Disable authentication cache reads and writes | off |
 | `--clear-auth-cache` | Delete the cache before authenticating | off |
@@ -160,15 +160,20 @@ Choice [1]:
 Saved escrow password in .local/device-profile.toml
   Joined keychain trust circle!
 [6/7] Fetching FindMy accessories from CloudKit...
-[7/7] Writing plist files...
-  🎧 Wilbur's AirTag (AirTag) -> .local/keys/Wilbur_s_AirTag_01234567-89AB-CDEF-0123-456789ABCDEF.plist
+[7/7] Writing plist and json files...
+  🎧 Wilbur's AirTag (AirTag) -> .local/keys/Wilbur_s_AirTag_01234567-89AB-CDEF-0123-456789ABCDEF.plist + .local/keys/Wilbur_s_AirTag_01234567-89AB-CDEF-0123-456789ABCDEF.json
 
-Done! Exported 1 accessory plist file(s) to .local/keys
+Done! Exported 1 accessory file pair(s) (plist + json) to .local/keys
 ```
 
 ## Output format
 
-Each accessory produces a `.plist` file containing:
+Each accessory produces a matched pair of files with the same basename:
+
+- `.plist` — Apple-style property-list format
+- `.json` — FindMy.py native JSON format
+
+### Plist contents
 
 | Key | Description |
 |-----|-------------|
@@ -182,13 +187,30 @@ Each accessory produces a `.plist` file containing:
 | `model` | Hardware model |
 | `pairingDate` | When the accessory was paired |
 
-These files can be used directly with [FindMy.py](https://github.com/malmeloo/FindMy.py) for tracking AirTag locations.
+### JSON contents
+
+| Key | Description |
+|-----|-------------|
+| `type` | Always `"accessory"` |
+| `master_key` | Last 28 bytes of the private key (hex) |
+| `skn` | Primary shared secret (hex) |
+| `sks` | Secondary shared secret (hex) |
+| `paired_at` | Pairing timestamp (ISO 8601) |
+| `name` | User-assigned name |
+| `model` | Hardware model |
+| `identifier` | Stable accessory identifier |
+| `group_identifier` | Group ID for multi-part accessories (e.g. AirPods) — always `null` for now |
+| `serial_number` | Parsed hardware serial number, when detectable |
+| `alignment_date` | Last known alignment timestamp (ISO 8601) |
+| `alignment_index` | Key index at the alignment timestamp |
+
+Both files contain the same private key material and can be used directly with [FindMy.py](https://github.com/malmeloo/FindMy.py) for tracking AirTag locations.
 
 ## Security notes
 
-- **Exported accessory files contain private key material.** This includes the
-  output plist files and any JSON files produced from them. Treat these files
-  like passwords: do not commit, publish, or send them to untrusted systems.
+- **Exported accessory files contain private key material.** This includes both
+  the output `.plist` and `.json` files. Treat these files like passwords: do
+  not commit, publish, or send them to untrusted systems.
 - `auth_cache.plist` contains reusable Apple authentication tokens and the
   SHA-256 hash of your password.
 - The private `device-profile.toml` contains the persistent synthetic device
@@ -220,6 +242,6 @@ These files can be used directly with [FindMy.py](https://github.com/malmeloo/Fi
 3. Joins the iCloud Keychain trust circle via escrow recovery (using your device passcode)
 4. Fetches encrypted `BeaconStore` records from CloudKit
 5. Decrypts records using PCS (Protected CloudStorage) keys from the keychain
-6. Writes accessory data to plist files
+6. Writes accessory data to matched plist and json file pairs
 
 Built on [rustpush](https://github.com/OpenBubbles/rustpush) by the OpenBubbles project.

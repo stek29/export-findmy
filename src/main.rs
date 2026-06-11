@@ -282,6 +282,25 @@ fn profile_bool(
         .ok_or_else(|| format!("device profile field `{section}.{key}` must be a boolean").into())
 }
 
+// ── Serial number extraction ────────────────────────────────────────────
+
+fn serial_from_identifier(identifier: &str) -> Option<String> {
+    if !identifier.contains("~#") {
+        return None;
+    }
+    let tail = identifier.rsplit("~#").next()?;
+    if tail.starts_with('¶') {
+        let sections: Vec<&str> = tail.split('§').collect();
+        if sections.len() >= 3 {
+            return hex::decode(sections[2])
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+        }
+        return None;
+    }
+    Some(tail.to_string())
+}
+
 // ── Plist generation ────────────────────────────────────────────────────
 
 fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
@@ -336,6 +355,62 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
     plist::Value::Dictionary(dict)
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn accessory_to_json(acc: &BeaconAccessory) -> serde_json::Value {
+    let secondary = acc
+        .master_record
+        .shared_secret_2
+        .as_ref()
+        .or(acc.master_record.secure_locations_shared_secret.as_ref());
+
+    let paired_at = acc
+        .master_record
+        .pairing_date
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_else(|| {
+            let dt: chrono::DateTime<chrono::Utc> = std::time::SystemTime::UNIX_EPOCH.into();
+            dt.to_rfc3339()
+        });
+
+    let alignment_date = acc
+        .alignment
+        .last_index_observation_date
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339()
+        });
+
+    // The Apple plist stores the private key as a 32-byte blob, but only the
+    // last 28 bytes are the actual SECP224R1 key material.  Truncating to 28
+    // bytes matches what FindMy.py expects (see
+    // findmy/accessory.py:423 and _AccessoryKeyGenerator which validates
+    // len(master_key) == 28).
+    let key = acc.master_record.private_key.as_slice();
+    let start = key.len().saturating_sub(28);
+    let master_key = bytes_to_hex(&key[start..]);
+
+    serde_json::json!({
+        "type": "accessory",
+        "master_key": master_key,
+        "skn": bytes_to_hex(&acc.master_record.shared_secret),
+        "sks": secondary.map(|s| bytes_to_hex(s)),
+        "paired_at": paired_at,
+        "name": acc.naming.name.clone(),
+        "model": acc.master_record.model.clone(),
+        "identifier": acc.master_record.stable_identifier.clone(),
+        "group_identifier": None::<String>,
+        "serial_number": serial_from_identifier(&acc.master_record.stable_identifier),
+        "alignment_date": alignment_date,
+        "alignment_index": acc.alignment.last_index_observed,
+    })
+}
+
 fn escrow_client_metadata_string<'a>(metadata: &'a plist::Value, key: &str) -> Option<&'a str> {
     let plist::Value::Dictionary(metadata) = metadata else {
         return None;
@@ -387,11 +462,11 @@ fn sanitize_filename_component(value: &str, fallback: &str) -> String {
     }
 }
 
-fn accessory_filename(name: &str, model: &str, stable_identifier: &str) -> String {
+fn accessory_basename(name: &str, model: &str, stable_identifier: &str) -> String {
     let safe_name = sanitize_filename_component(name, "Unknown");
     let safe_model = sanitize_filename_component(model, "unknown-model");
     let safe_identifier = sanitize_filename_component(stable_identifier, "unknown-id");
-    format!("{safe_name}_{safe_model}_{safe_identifier}.plist")
+    format!("{safe_name}_{safe_model}_{safe_identifier}")
 }
 
 // ── Password reading ────────────────────────────────────────────────────
@@ -1375,8 +1450,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // ── Step 7: Write plist files ───────────────────────────────────
-    eprintln!("[7/7] Writing plist files...");
+    // ── Step 7: Write plist and json files ──────────────────────────
+    eprintln!("[7/7] Writing plist and json files...");
 
     if accessories.is_empty() {
         eprintln!("  No accessories found!");
@@ -1386,33 +1461,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output_paths = HashSet::new();
 
     for acc in accessories.values() {
-        let filename = accessory_filename(
+        let basename = accessory_basename(
             &acc.naming.name,
             &acc.master_record.model,
             &acc.master_record.stable_identifier,
         );
-        let path = output_dir.join(filename);
-        if !output_paths.insert(path.clone()) {
-            return Err(format!(
-                "multiple accessories resolve to the same output path: {}",
-                path.display()
-            )
-            .into());
+        let plist_path = output_dir.join(format!("{basename}.plist"));
+        let json_path = output_dir.join(format!("{basename}.json"));
+
+        for path in [&plist_path, &json_path] {
+            if !output_paths.insert(path.clone()) {
+                return Err(format!(
+                    "multiple accessories resolve to the same output path: {}",
+                    path.display()
+                )
+                .into());
+            }
         }
-        plist::to_file_xml(&path, &accessory_to_plist(acc))?;
+
+        plist::to_file_xml(&plist_path, &accessory_to_plist(acc))?;
+        std::fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&accessory_to_json(acc))? + "\n",
+        )?;
 
         eprintln!(
-            "  {} {} ({}) -> {}",
+            "  {} {} ({}) -> {} + {}",
             acc.naming.emoji,
             acc.naming.name,
             acc.master_record.model,
-            path.display()
+            plist_path.display(),
+            json_path.display()
         );
     }
 
     eprintln!();
     eprintln!(
-        "Done! Exported {} accessory plist file(s) to {}",
+        "Done! Exported {} accessory file pair(s) (plist + json) to {}",
         accessories.len(),
         output_dir.display()
     );
@@ -1423,31 +1508,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accessory_filename, remove_auth_cache, sanitize_filename_component, DeviceProfile,
+        accessory_basename, accessory_to_json, remove_auth_cache,
+        sanitize_filename_component, serial_from_identifier, DeviceProfile,
     };
     use std::fs;
 
     #[test]
     fn duplicate_names_use_distinct_identifiers() {
-        let first = accessory_filename("Keys", "AirTag", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE");
-        let second = accessory_filename("Keys", "AirTag", "11111111-2222-3333-4444-555555555555");
+        let first = accessory_basename("Keys", "AirTag", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE");
+        let second = accessory_basename("Keys", "AirTag", "11111111-2222-3333-4444-555555555555");
 
         assert_ne!(first, second);
         assert_eq!(
             first,
-            "Keys_AirTag_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE.plist"
+            "Keys_AirTag_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
         );
     }
 
     #[test]
     fn filename_components_replace_unsafe_characters() {
         assert_eq!(
-            accessory_filename(
+            accessory_basename(
                 "Work / Bag",
                 "AirPods Pro (3rd generation)",
                 "id:with/slashes"
             ),
-            "Work___Bag_AirPods_Pro__3rd_generation__id_with_slashes.plist"
+            "Work___Bag_AirPods_Pro__3rd_generation__id_with_slashes"
         );
     }
 
@@ -1455,8 +1541,8 @@ mod tests {
     fn empty_components_get_readable_fallbacks() {
         assert_eq!(sanitize_filename_component("", "fallback"), "fallback");
         assert_eq!(
-            accessory_filename("", "", ""),
-            "Unknown_unknown-model_unknown-id.plist"
+            accessory_basename("", "", ""),
+            "Unknown_unknown-model_unknown-id"
         );
     }
 
@@ -1585,5 +1671,104 @@ configured = false
             0o600
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn serial_from_airtag_identifier() {
+        assert_eq!(
+            serial_from_identifier("2006~#HWID123~#ABC123"),
+            Some("ABC123".to_string())
+        );
+    }
+
+    #[test]
+    fn serial_from_airpods_identifier() {
+        assert_eq!(
+            serial_from_identifier("a:/uuid-here~#¶model§hwid§485830304141§left"),
+            Some("HX00AA".to_string())
+        );
+    }
+
+    #[test]
+    fn serial_from_third_party_identifier() {
+        assert_eq!(
+            serial_from_identifier("a:/some-uuid~#THIRDPARTY01"),
+            Some("THIRDPARTY01".to_string())
+        );
+    }
+
+    #[test]
+    fn serial_from_identifier_without_tilde_hash() {
+        assert_eq!(serial_from_identifier("just-an-identifier"), None);
+    }
+
+    #[test]
+    fn accessory_basename_produces_expected_format() {
+        let basename = accessory_basename("Keys", "AirTag", "ID-123");
+        assert_eq!(basename, "Keys_AirTag_ID-123");
+    }
+
+    #[test]
+    fn json_output_has_expected_schema() {
+        use rustpush::findmy::{BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord, MasterBeaconRecord};
+        use std::time::SystemTime;
+
+        let master = MasterBeaconRecord {
+            product_id: 1,
+            stable_identifier: "2006~#HWID~#ABC123".to_string(),
+            pairing_date: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000)),
+            battery_level: 100,
+            shared_secret_2: Some(vec![0xAB, 0xCD]),
+            secure_locations_shared_secret: None,
+            private_key: vec![0u8; 28],
+            system_version: "17.0".to_string(),
+            shared_secret: vec![0xEF, 0x01],
+            public_key: vec![0x02, 0x03],
+            model: "AirTag".to_string(),
+            vendor_id: 1,
+            is_zeus: 0,
+        };
+
+        let naming = BeaconNamingRecord {
+            emoji: "🔑".to_string(),
+            name: "Keys".to_string(),
+            associated_beacon: "beacon-id".to_string(),
+            role_id: 0,
+        };
+
+        let alignment = KeyAlignmentRecord {
+            beacon_identifier: "beacon-id".to_string(),
+            last_index_observed: 42,
+            last_index_observation_date: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700003600)),
+        };
+
+        let acc = BeaconAccessory {
+            master_record: master,
+            naming,
+            naming_id: "naming-id".to_string(),
+            naming_prot_tag: None,
+            alignment: alignment.clone(),
+            alignment_id: "alignment-id".to_string(),
+            aligment_prot_tag: None,
+            local_alignment: alignment,
+            last_report: None,
+            primary_ratchet: BeaconRatchet::default(),
+            secondary_ratchet: BeaconRatchet::default(),
+        };
+
+        let json = accessory_to_json(&acc);
+        let obj = json.as_object().unwrap();
+
+        assert_eq!(obj.get("type").unwrap().as_str().unwrap(), "accessory");
+        assert_eq!(obj.get("master_key").unwrap().as_str().unwrap(), "00000000000000000000000000000000000000000000000000000000");
+        assert_eq!(obj.get("skn").unwrap().as_str().unwrap(), "ef01");
+        assert_eq!(obj.get("sks").unwrap().as_str().unwrap(), "abcd");
+        assert_eq!(obj.get("name").unwrap().as_str().unwrap(), "Keys");
+        assert_eq!(obj.get("model").unwrap().as_str().unwrap(), "AirTag");
+        assert_eq!(obj.get("identifier").unwrap().as_str().unwrap(), "2006~#HWID~#ABC123");
+        assert_eq!(obj.get("serial_number").unwrap().as_str().unwrap(), "ABC123");
+        assert_eq!(obj.get("alignment_index").unwrap().as_i64().unwrap(), 42);
+        assert!(obj.get("group_identifier").unwrap().is_null());
+        assert!(obj.get("alignment_date").unwrap().is_string());
     }
 }
