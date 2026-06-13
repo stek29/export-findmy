@@ -427,6 +427,7 @@ fn accessory_to_json(acc: &BeaconAccessory) -> serde_json::Value {
         "sks": secondary.map(|s| bytes_to_hex(s)),
         "paired_at": paired_at,
         "name": acc.naming.name.clone(),
+        "emoji": acc.naming.emoji.clone(),
         "model": acc.master_record.model.clone(),
         "identifier": acc.master_record.stable_identifier.clone(),
         "group_identifier": acc.master_record.group_identifier.clone(),
@@ -1830,6 +1831,7 @@ configured = false
         assert_eq!(obj.get("skn").unwrap().as_str().unwrap(), "ef01");
         assert_eq!(obj.get("sks").unwrap().as_str().unwrap(), "abcd");
         assert_eq!(obj.get("name").unwrap().as_str().unwrap(), "Keys");
+        assert_eq!(obj.get("emoji").unwrap().as_str().unwrap(), "🔑");
         assert_eq!(obj.get("model").unwrap().as_str().unwrap(), "AirTag");
         assert_eq!(
             obj.get("identifier").unwrap().as_str().unwrap(),
