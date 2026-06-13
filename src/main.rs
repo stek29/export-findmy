@@ -303,36 +303,58 @@ fn serial_from_identifier(identifier: &str) -> Option<String> {
 
 // ── Plist generation ────────────────────────────────────────────────────
 
+fn key_data_plist(data: &[u8]) -> plist::Value {
+    let mut key = Dictionary::new();
+    key.insert("data".to_string(), plist::Value::Data(data.to_vec()));
+
+    let mut wrapper = Dictionary::new();
+    wrapper.insert("key".to_string(), plist::Value::Dictionary(key));
+    plist::Value::Dictionary(wrapper)
+}
+
+fn plist_date(time: std::time::SystemTime) -> plist::Date {
+    let whole_seconds = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| {
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(duration.as_secs())
+        })
+        .unwrap_or(time);
+    whole_seconds.into()
+}
+
 fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
     let mut dict = Dictionary::new();
 
     dict.insert(
         "privateKey".to_string(),
-        plist::Value::Data(acc.master_record.private_key.clone()),
+        key_data_plist(&acc.master_record.private_key),
     );
     dict.insert(
         "sharedSecret".to_string(),
-        plist::Value::Data(acc.master_record.shared_secret.clone()),
+        key_data_plist(&acc.master_record.shared_secret),
     );
     if let Some(ref ss2) = acc.master_record.shared_secret_2 {
-        dict.insert(
-            "secondarySharedSecret".to_string(),
-            plist::Value::Data(ss2.clone()),
-        );
+        dict.insert("secondarySharedSecret".to_string(), key_data_plist(ss2));
     }
     if let Some(ref slss) = acc.master_record.secure_locations_shared_secret {
         dict.insert(
             "secureLocationsSharedSecret".to_string(),
-            plist::Value::Data(slss.clone()),
+            key_data_plist(slss),
         );
     }
     dict.insert(
         "publicKey".to_string(),
-        plist::Value::Data(acc.master_record.public_key.clone()),
+        key_data_plist(&acc.master_record.public_key),
     );
     dict.insert(
         "identifier".to_string(),
         plist::Value::String(acc.master_record.stable_identifier.clone()),
+    );
+    dict.insert(
+        "stableIdentifier".to_string(),
+        plist::Value::Array(vec![plist::Value::String(
+            acc.master_record.stable_identifier.clone(),
+        )]),
     );
     dict.insert(
         "model".to_string(),
@@ -341,7 +363,7 @@ fn accessory_to_plist(acc: &BeaconAccessory) -> plist::Value {
     if let Some(pairing_date) = acc.master_record.pairing_date {
         dict.insert(
             "pairingDate".to_string(),
-            plist::Value::Date(pairing_date.into()),
+            plist::Value::Date(plist_date(pairing_date)),
         );
     }
     dict.insert(
@@ -384,13 +406,10 @@ fn accessory_to_json(acc: &BeaconAccessory) -> serde_json::Value {
             dt.to_rfc3339()
         });
 
-    let alignment_date = acc
-        .alignment
-        .last_index_observation_date
-        .map(|t| {
-            let dt: chrono::DateTime<chrono::Utc> = t.into();
-            dt.to_rfc3339()
-        });
+    let alignment_date = acc.alignment.last_index_observation_date.map(|t| {
+        let dt: chrono::DateTime<chrono::Utc> = t.into();
+        dt.to_rfc3339()
+    });
 
     // The Apple plist stores the private key as a 32-byte blob, but only the
     // last 28 bytes are the actual SECP224R1 key material.  Truncating to 28
@@ -818,17 +837,15 @@ async fn login_interactive(
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input).unwrap();
                 let index = input.trim().parse::<usize>().unwrap_or(0);
-                let method = methods
-                    .get(index)
-                    .ok_or_else(|| {
-                        icloud_auth::Error::AuthSrpWithMessage(
-                            0,
-                            format!(
-                                "Invalid method index {index}. Must be 0-{}.",
-                                methods.len() - 1
-                            ),
-                        )
-                    })?;
+                let method = methods.get(index).ok_or_else(|| {
+                    icloud_auth::Error::AuthSrpWithMessage(
+                        0,
+                        format!(
+                            "Invalid method index {index}. Must be 0-{}.",
+                            methods.len() - 1
+                        ),
+                    )
+                })?;
                 current_step = account.login_choose_method(method).await?;
             }
             LoginStep::EnterCode(_pending) => {
@@ -1551,7 +1568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accessory_basename, accessory_to_json, remove_auth_cache,
+        accessory_basename, accessory_to_json, accessory_to_plist, remove_auth_cache,
         sanitize_filename_component, serial_from_identifier, DeviceProfile,
     };
     use std::fs;
@@ -1562,10 +1579,7 @@ mod tests {
         let second = accessory_basename("Keys", "AirTag", "11111111-2222-3333-4444-555555555555");
 
         assert_ne!(first, second);
-        assert_eq!(
-            first,
-            "Keys_AirTag_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
-        );
+        assert_eq!(first, "Keys_AirTag_AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE");
     }
 
     #[test]
@@ -1753,7 +1767,10 @@ configured = false
 
     #[test]
     fn json_output_has_expected_schema() {
-        use rustpush::findmy::{BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord, MasterBeaconRecord};
+        use rustpush::findmy::{
+            BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord,
+            MasterBeaconRecord,
+        };
         use std::time::SystemTime;
 
         let master = MasterBeaconRecord {
@@ -1783,7 +1800,9 @@ configured = false
         let alignment = KeyAlignmentRecord {
             beacon_identifier: "beacon-id".to_string(),
             last_index_observed: 42,
-            last_index_observation_date: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700003600)),
+            last_index_observation_date: Some(
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700003600),
+            ),
         };
 
         let acc = BeaconAccessory {
@@ -1804,15 +1823,93 @@ configured = false
         let obj = json.as_object().unwrap();
 
         assert_eq!(obj.get("type").unwrap().as_str().unwrap(), "accessory");
-        assert_eq!(obj.get("master_key").unwrap().as_str().unwrap(), "00000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            obj.get("master_key").unwrap().as_str().unwrap(),
+            "00000000000000000000000000000000000000000000000000000000"
+        );
         assert_eq!(obj.get("skn").unwrap().as_str().unwrap(), "ef01");
         assert_eq!(obj.get("sks").unwrap().as_str().unwrap(), "abcd");
         assert_eq!(obj.get("name").unwrap().as_str().unwrap(), "Keys");
         assert_eq!(obj.get("model").unwrap().as_str().unwrap(), "AirTag");
-        assert_eq!(obj.get("identifier").unwrap().as_str().unwrap(), "2006~#HWID~#ABC123");
-        assert_eq!(obj.get("serial_number").unwrap().as_str().unwrap(), "ABC123");
+        assert_eq!(
+            obj.get("identifier").unwrap().as_str().unwrap(),
+            "2006~#HWID~#ABC123"
+        );
+        assert_eq!(
+            obj.get("serial_number").unwrap().as_str().unwrap(),
+            "ABC123"
+        );
         assert_eq!(obj.get("alignment_index").unwrap().as_i64().unwrap(), 42);
         assert!(obj.get("group_identifier").unwrap().is_null());
         assert!(obj.get("alignment_date").unwrap().is_string());
+    }
+
+    #[test]
+    fn plist_output_matches_findmypy_schema() {
+        use rustpush::findmy::{
+            BeaconAccessory, BeaconNamingRecord, BeaconRatchet, KeyAlignmentRecord,
+            MasterBeaconRecord,
+        };
+        use std::time::SystemTime;
+
+        let alignment = KeyAlignmentRecord {
+            beacon_identifier: "beacon-id".to_string(),
+            last_index_observed: 0,
+            last_index_observation_date: None,
+        };
+        let acc = BeaconAccessory {
+            master_record: MasterBeaconRecord {
+                product_id: 1,
+                stable_identifier: "2006~#HWID~#ABC123".to_string(),
+                pairing_date: Some(
+                    SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_nanos(1_700_000_000_123_456_789),
+                ),
+                battery_level: 100,
+                shared_secret_2: Some(vec![0xAB, 0xCD]),
+                secure_locations_shared_secret: None,
+                private_key: vec![0x01; 32],
+                system_version: "17.0".to_string(),
+                shared_secret: vec![0xEF, 0x01],
+                public_key: vec![0x02, 0x03],
+                model: "AirTag".to_string(),
+                vendor_id: 1,
+                is_zeus: 0,
+                group_identifier: None,
+            },
+            naming: BeaconNamingRecord {
+                emoji: String::new(),
+                name: "Keys".to_string(),
+                associated_beacon: "beacon-id".to_string(),
+                role_id: 0,
+            },
+            naming_id: "naming-id".to_string(),
+            naming_prot_tag: None,
+            alignment: alignment.clone(),
+            alignment_id: "alignment-id".to_string(),
+            aligment_prot_tag: None,
+            local_alignment: alignment,
+            last_report: None,
+            primary_ratchet: BeaconRatchet::default(),
+            secondary_ratchet: BeaconRatchet::default(),
+        };
+
+        let plist = accessory_to_plist(&acc);
+        let dict = plist.as_dictionary().unwrap();
+        let private_key = dict["privateKey"].as_dictionary().unwrap();
+        let key = private_key["key"].as_dictionary().unwrap();
+
+        assert_eq!(key["data"].as_data().unwrap(), &[0x01; 32]);
+        assert_eq!(
+            dict["stableIdentifier"].as_array().unwrap()[0]
+                .as_string()
+                .unwrap(),
+            "2006~#HWID~#ABC123"
+        );
+
+        let mut xml = Vec::new();
+        plist::to_writer_xml(&mut xml, &plist).unwrap();
+        let xml = String::from_utf8(xml).unwrap();
+        assert!(xml.contains("<date>2023-11-14T22:13:20Z</date>"));
     }
 }
